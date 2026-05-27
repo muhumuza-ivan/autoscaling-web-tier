@@ -1,0 +1,522 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Highly available, auto-scaling web tier.
+  Multi-AZ VPC with public subnets (ALB) and private subnets (EC2 ASG behind a NAT Gateway).
+  Apache HTTP server deployed via User Data; scale-out on average CPU > 30%.
+
+# =====================================================================
+# PARAMETERS
+# =====================================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: webtier
+    Description: Prefix applied to resource names/tags.
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for the VPC.
+
+  PublicSubnet1Cidr:
+    Type: String
+    Default: 10.0.1.0/24
+
+  PublicSubnet2Cidr:
+    Type: String
+    Default: 10.0.2.0/24
+
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: 10.0.11.0/24
+
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: 10.0.12.0/24
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small, t3.medium]
+    Description: EC2 instance type for the ASG.
+
+  LatestAmazonLinuxAmi:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Latest Amazon Linux 2023 AMI resolved from SSM Public Parameter Store.
+
+  CpuScaleOutThreshold:
+    Type: Number
+    Default: 30
+    Description: Target average CPU utilization (%) that triggers scale-out.
+
+# =====================================================================
+# RESOURCES
+# =====================================================================
+Resources:
+
+  # -------------------------------------------------------------------
+  # NETWORKING: VPC, IGW, Subnets
+  # -------------------------------------------------------------------
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-igw
+
+  IgwAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-public-1
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-public-2
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-private-1
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-private-2
+
+  # -------------------------------------------------------------------
+  # NAT GATEWAY (Regional - single NAT for cost optimization)
+  # -------------------------------------------------------------------
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: IgwAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-nat-eip
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-nat
+
+  # -------------------------------------------------------------------
+  # ROUTE TABLES
+  # -------------------------------------------------------------------
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-public-rt
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-private-rt
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # -------------------------------------------------------------------
+  # SECURITY GROUPS
+  # -------------------------------------------------------------------
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP from the internet to the ALB
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP from anywhere
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-alb-sg
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP only from the ALB; no SSH
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+          Description: HTTP from ALB only
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-instance-sg
+
+  # -------------------------------------------------------------------
+  # IAM ROLE FOR EC2 (SSM Session Manager - no SSH needed)
+  # -------------------------------------------------------------------
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-instance-role
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
+  # -------------------------------------------------------------------
+  # APPLICATION LOAD BALANCER + TARGET GROUP + LISTENER
+  # -------------------------------------------------------------------
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${ProjectName}-alb
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-alb
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${ProjectName}-tg
+      VpcId: !Ref VPC
+      Port: 80
+      Protocol: HTTP
+      TargetType: instance
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      # round_robin is the default for ALB target groups
+      TargetGroupAttributes:
+        - Key: load_balancing.algorithm.type
+          Value: round_robin
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-tg
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # -------------------------------------------------------------------
+  # LAUNCH TEMPLATE + USER DATA (Apache + demo app + stress button)
+  # -------------------------------------------------------------------
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub ${ProjectName}-lt
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmazonLinuxAmi
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt InstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref InstanceSecurityGroup
+        MetadataOptions:
+          HttpTokens: required        # IMDSv2 enforced
+          HttpEndpoint: enabled
+        Monitoring:
+          Enabled: true
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub ${ProjectName}-asg-instance
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euxo pipefail
+
+            # --- Package install ---
+            dnf update -y
+            dnf install -y httpd stress-ng
+
+            systemctl enable httpd
+            systemctl start httpd
+
+            # --- Fetch instance metadata via IMDSv2 ---
+            TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+              -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+            INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+              http://169.254.169.254/latest/meta-data/instance-id)
+            AZ=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+              http://169.254.169.254/latest/meta-data/placement/availability-zone)
+            PRIVATE_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+              http://169.254.169.254/latest/meta-data/local-ipv4)
+
+            # --- Stress trigger CGI script ---
+            mkdir -p /var/www/cgi-bin
+            cat > /var/www/cgi-bin/stress.sh <<'STRESS_EOF'
+            #!/bin/bash
+            echo "Content-type: text/html"
+            echo ""
+            # Run stress-ng in background for 5 minutes, all CPU cores @ 90%
+            nohup stress-ng --cpu 0 --cpu-load 90 --timeout 300s >/dev/null 2>&1 &
+            echo "<html><body style='font-family:sans-serif;background:#0b1220;color:#fff;padding:40px;text-align:center'>"
+            echo "<h1>CPU stress started</h1>"
+            echo "<p>Running stress-ng for 5 minutes. Watch your ASG scale out.</p>"
+            echo "<a href='/' style='color:#7dd3fc'>Back</a>"
+            echo "</body></html>"
+            STRESS_EOF
+            chmod +x /var/www/cgi-bin/stress.sh
+
+            # Enable CGI in Apache
+            cat > /etc/httpd/conf.d/cgi.conf <<'CGI_EOF'
+            <Directory "/var/www/cgi-bin">
+              AllowOverride None
+              Options +ExecCGI
+              AddHandler cgi-script .sh
+              Require all granted
+            </Directory>
+            ScriptAlias /cgi-bin/ "/var/www/cgi-bin/"
+            CGI_EOF
+
+            # --- Index page with instance info + stress button ---
+            cat > /var/www/html/index.html <<HTML_EOF
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+              <meta charset="utf-8">
+              <title>Auto Scaling Web Tier Demo</title>
+              <meta name="viewport" content="width=device-width,initial-scale=1">
+              <style>
+                * { box-sizing: border-box; }
+                body {
+                  font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+                  margin: 0; min-height: 100vh;
+                  background: linear-gradient(135deg, #0f172a, #1e293b);
+                  color: #e2e8f0;
+                  display: flex; align-items: center; justify-content: center;
+                  padding: 24px;
+                }
+                .card {
+                  background: rgba(255,255,255,0.05);
+                  border: 1px solid rgba(255,255,255,0.1);
+                  border-radius: 16px;
+                  padding: 40px;
+                  max-width: 560px;
+                  width: 100%;
+                  backdrop-filter: blur(10px);
+                  box-shadow: 0 20px 60px rgba(0,0,0,0.4);
+                }
+                h1 { margin: 0 0 8px; font-size: 28px; }
+                .subtitle { color: #94a3b8; margin-bottom: 28px; font-size: 14px; }
+                .info { display: grid; gap: 12px; margin-bottom: 28px; }
+                .row {
+                  display: flex; justify-content: space-between;
+                  padding: 12px 16px;
+                  background: rgba(255,255,255,0.03);
+                  border-radius: 8px;
+                  border-left: 3px solid #38bdf8;
+                  font-family: ui-monospace, monospace;
+                  font-size: 14px;
+                }
+                .label { color: #94a3b8; }
+                .value { color: #f1f5f9; font-weight: 600; }
+                .btn {
+                  display: block; width: 100%;
+                  padding: 16px; border: 0; border-radius: 10px;
+                  background: linear-gradient(135deg, #ef4444, #dc2626);
+                  color: white; font-size: 16px; font-weight: 600;
+                  cursor: pointer; text-decoration: none; text-align: center;
+                  transition: transform 0.1s;
+                }
+                .btn:hover { transform: translateY(-1px); }
+                .footer { margin-top: 20px; text-align: center; color: #64748b; font-size: 12px; }
+              </style>
+            </head>
+            <body>
+              <div class="card">
+                <h1>🚀 Web Tier Demo</h1>
+                <p class="subtitle">Refresh repeatedly to observe ALB round-robin across instances.</p>
+                <div class="info">
+                  <div class="row"><span class="label">Instance ID</span><span class="value">${!INSTANCE_ID}</span></div>
+                  <div class="row"><span class="label">Availability Zone</span><span class="value">${!AZ}</span></div>
+                  <div class="row"><span class="label">Private IP</span><span class="value">${!PRIVATE_IP}</span></div>
+                </div>
+                <a class="btn" href="/cgi-bin/stress.sh">🔥 Trigger CPU Stress (5 min)</a>
+                <div class="footer">Powered by EC2 Auto Scaling + Application Load Balancer</div>
+              </div>
+            </body>
+            </html>
+            HTML_EOF
+
+            systemctl restart httpd
+
+  # -------------------------------------------------------------------
+  # AUTO SCALING GROUP + SCALING POLICY
+  # -------------------------------------------------------------------
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub ${ProjectName}-asg
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: '1'
+      DesiredCapacity: '1'
+      MaxSize: '4'
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 120
+      TargetGroupARNs:
+        - !Ref TargetGroup
+      MetricsCollection:
+        - Granularity: 1Minute
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-asg-instance
+          PropagateAtLaunch: true
+
+  # Target tracking: keep average CPU at the configured threshold (30%).
+  # When average CPU exceeds the target, ASG scales out automatically.
+  CpuScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: !Ref CpuScaleOutThreshold
+        DisableScaleIn: false   # allow scale-in for cost optimization (extra credit)
+
+# =====================================================================
+# OUTPUTS
+# =====================================================================
+Outputs:
+  AlbDnsName:
+    Description: Public DNS name of the Application Load Balancer (open this in a browser).
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub ${ProjectName}-alb-dns
+
+  AlbUrl:
+    Description: Full HTTP URL for the application.
+    Value: !Sub http://${ApplicationLoadBalancer.DNSName}
+
+  AutoScalingGroupName:
+    Description: Name of the Auto Scaling Group.
+    Value: !Ref AutoScalingGroup
+
+  VpcId:
+    Description: VPC ID.
+    Value: !Ref VPC
