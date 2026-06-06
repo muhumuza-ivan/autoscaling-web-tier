@@ -378,8 +378,6 @@ Resources:
             chmod +x /var/www/cgi-bin/stress.sh
 
             # Enable CGI in Apache.
-            # Note: ScriptAlias for /cgi-bin/ is already defined in httpd.conf,
-            # so we only need the Directory block here to avoid an AH00671 warning.
             cat > /etc/httpd/conf.d/cgi.conf <<'CGI_EOF'
             <Directory "/var/www/cgi-bin">
               AllowOverride None
@@ -445,14 +443,14 @@ Resources:
             </head>
             <body>
               <div class="card">
-                <h1>🚀 Web Tier Demo</h1>
+                <h1>Web Tier Demo</h1>
                 <p class="subtitle">Refresh repeatedly to observe ALB round-robin across instances.</p>
                 <div class="info">
                   <div class="row"><span class="label">Instance ID</span><span class="value">${!INSTANCE_ID}</span></div>
                   <div class="row"><span class="label">Availability Zone</span><span class="value">${!AZ}</span></div>
                   <div class="row"><span class="label">Private IP</span><span class="value">${!PRIVATE_IP}</span></div>
                 </div>
-                <a class="btn" href="/cgi-bin/stress.sh">🔥 Trigger CPU Stress (5 min)</a>
+                <a class="btn" href="/cgi-bin/stress.sh">Trigger CPU Stress</a>
                 <div class="footer">Powered by EC2 Auto Scaling + Application Load Balancer</div>
               </div>
             </body>
@@ -503,7 +501,7 @@ Resources:
         PredefinedMetricSpecification:
           PredefinedMetricType: ASGAverageCPUUtilization
         TargetValue: !Ref CpuScaleOutThreshold
-        DisableScaleIn: false   # allow scale-in for cost optimization (extra credit)
+        DisableScaleIn: false   # allow scale-in for cost optimization
 
 # =====================================================================
 # OUTPUTS
