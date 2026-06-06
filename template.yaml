@@ -366,8 +366,9 @@ Resources:
             #!/bin/bash
             echo "Content-type: text/html"
             echo ""
-            # Run stress-ng in background for 5 minutes, all CPU cores @ 90%
-            nohup stress-ng --cpu 0 --cpu-load 90 --timeout 300s >/dev/null 2>&1 &
+            # setsid creates a new session so stress-ng is detached from Apache's
+            # process group and survives after the CGI script exits.
+            setsid stress-ng --cpu 0 --cpu-load 90 --timeout 480s >/dev/null 2>&1 &
             echo "<html><body style='font-family:sans-serif;background:#0b1220;color:#fff;padding:40px;text-align:center'>"
             echo "<h1>CPU stress started</h1>"
             echo "<p>Running stress-ng for 5 minutes. Watch your ASG scale out.</p>"
@@ -376,7 +377,9 @@ Resources:
             STRESS_EOF
             chmod +x /var/www/cgi-bin/stress.sh
 
-            # Enable CGI in Apache
+            # Enable CGI in Apache.
+            # Note: ScriptAlias for /cgi-bin/ is already defined in httpd.conf,
+            # so we only need the Directory block here to avoid an AH00671 warning.
             cat > /etc/httpd/conf.d/cgi.conf <<'CGI_EOF'
             <Directory "/var/www/cgi-bin">
               AllowOverride None
@@ -384,7 +387,6 @@ Resources:
               AddHandler cgi-script .sh
               Require all granted
             </Directory>
-            ScriptAlias /cgi-bin/ "/var/www/cgi-bin/"
             CGI_EOF
 
             # --- Index page with instance info + stress button ---
@@ -476,7 +478,7 @@ Resources:
       DesiredCapacity: '1'
       MaxSize: '4'
       HealthCheckType: ELB
-      HealthCheckGracePeriod: 120
+      HealthCheckGracePeriod: 60
       TargetGroupARNs:
         - !Ref TargetGroup
       MetricsCollection:
@@ -493,6 +495,10 @@ Resources:
     Properties:
       AutoScalingGroupName: !Ref AutoScalingGroup
       PolicyType: TargetTrackingScaling
+      # EstimatedInstanceWarmup: how long the policy waits after launching a new
+      # instance before including it in the scaling metric calculation.
+      # 60s (vs the 300s default) makes scale-out decisions much faster for demos.
+      EstimatedInstanceWarmup: 60
       TargetTrackingConfiguration:
         PredefinedMetricSpecification:
           PredefinedMetricType: ASGAverageCPUUtilization
