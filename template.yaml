@@ -368,7 +368,7 @@ Resources:
             echo ""
             # setsid creates a new session so stress-ng is detached from Apache's
             # process group and survives after the CGI script exits.
-            setsid stress-ng --cpu 0 --cpu-load 90 --timeout 480s >/dev/null 2>&1 &
+            setsid stress-ng --cpu 0 --cpu-load 90 --timeout 480s --temp-path /tmp >/dev/null 2>&1 &
             echo "<html><body style='font-family:sans-serif;background:#0b1220;color:#fff;padding:40px;text-align:center'>"
             echo "<h1>CPU stress started</h1>"
             echo "<p>Running stress-ng for 5 minutes. Watch your ASG scale out.</p>"
